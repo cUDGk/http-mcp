@@ -2,252 +2,191 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Buffer } from "node:buffer";
+import { writeFileSync } from "node:fs";
 import { z } from "zod";
-import { request as undiciRequest, Agent, interceptors } from "undici";
-
-const DEFAULT_TIMEOUT = parseInt(process.env.HTTP_TIMEOUT ?? "30000", 10);
-const MAX_BODY_BYTES = parseInt(process.env.HTTP_MAX_BODY ?? "2097152", 10); // 2 MiB
-const USER_AGENT = process.env.HTTP_USER_AGENT ?? "http-mcp/0.1";
-const TEXTUAL = /^(text\/|application\/(json|xml|x-www-form-urlencoded|javascript|graphql|ld\+json|yaml|x-yaml))|(\+json|\+xml)$/;
-
-type Resp = {
-  url: string;
-  status: number;
-  status_text: string;
-  http_version?: string;
-  headers: Record<string, string>;
-  content_type: string | null;
-  content_length: number | null;
-  body_encoding: "text" | "base64";
-  body: string;
-  body_truncated: boolean;
-  redirects: string[];
-  duration_ms: number;
-};
-
-function headersToObject(h: Record<string, string | string[] | undefined>): Record<string, string> {
-  const o: Record<string, string> = {};
-  for (const [k, v] of Object.entries(h)) {
-    if (v === undefined) continue;
-    o[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : v;
-  }
-  return o;
-}
-
-function basicAuth(user: string, pass: string): string {
-  return "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
-}
-
-function isTextual(contentType: string | null): boolean {
-  if (!contentType) return false;
-  const lower = contentType.toLowerCase();
-  return TEXTUAL.test(lower);
-}
-
-async function doRequest(p: {
-  url: string;
-  method?: string;
-  headers?: Record<string, string>;
-  body?: string;
-  body_base64?: string;
-  json?: unknown;
-  form?: Record<string, string>;
-  query?: Record<string, string | number | boolean | (string | number)[]>;
-  basic_auth?: { user: string; password: string };
-  bearer?: string;
-  timeout?: number;
-  follow_redirects?: boolean;
-  max_redirects?: number;
-  reject_unauthorized?: boolean;
-  max_body_bytes?: number;
-}): Promise<Resp> {
-  const t0 = Date.now();
-
-  // Build URL with query params
-  const u = new URL(p.url);
-  if (p.query) {
-    for (const [k, v] of Object.entries(p.query)) {
-      if (Array.isArray(v)) for (const vv of v) u.searchParams.append(k, String(vv));
-      else u.searchParams.append(k, String(v));
-    }
-  }
-
-  const headers: Record<string, string> = {
-    "user-agent": USER_AGENT,
-    accept: "*/*",
-  };
-  if (p.headers) {
-    for (const [k, v] of Object.entries(p.headers)) headers[k.toLowerCase()] = v;
-  }
-
-  if (p.basic_auth) headers["authorization"] = basicAuth(p.basic_auth.user, p.basic_auth.password);
-  if (p.bearer) headers["authorization"] = `Bearer ${p.bearer}`;
-
-  // Body resolution
-  let body: string | Buffer | undefined;
-  if (p.json !== undefined) {
-    body = JSON.stringify(p.json);
-    if (!headers["content-type"]) headers["content-type"] = "application/json";
-  } else if (p.form) {
-    body = new URLSearchParams(p.form).toString();
-    if (!headers["content-type"]) headers["content-type"] = "application/x-www-form-urlencoded";
-  } else if (p.body_base64 !== undefined) {
-    body = Buffer.from(p.body_base64, "base64");
-  } else if (p.body !== undefined) {
-    body = p.body;
-  }
-
-  const dispatcher = new Agent({
-    connect: {
-      rejectUnauthorized: p.reject_unauthorized !== false,
-    },
-    headersTimeout: p.timeout ?? DEFAULT_TIMEOUT,
-    bodyTimeout: p.timeout ?? DEFAULT_TIMEOUT,
-  });
-
-  const maxRedirects = p.follow_redirects === false ? 0 : (p.max_redirects ?? 5);
-  const composed = maxRedirects > 0
-    ? dispatcher.compose(interceptors.redirect({ maxRedirections: maxRedirects }))
-    : dispatcher;
-
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), p.timeout ?? DEFAULT_TIMEOUT);
-
-  try {
-    const res = await undiciRequest(u.toString(), {
-      method: (p.method ?? "GET").toUpperCase() as any,
-      headers,
-      body: body as any,
-      signal: ac.signal,
-      dispatcher: composed,
-    });
-    const respHeaders = headersToObject(res.headers as any);
-    const contentType = respHeaders["content-type"] ?? null;
-    const contentLength = respHeaders["content-length"] ? parseInt(respHeaders["content-length"], 10) : null;
-    const maxBytes = p.max_body_bytes ?? MAX_BODY_BYTES;
-
-    const chunks: Buffer[] = [];
-    let received = 0;
-    let truncated = false;
-    for await (const chunk of res.body) {
-      const buf = typeof chunk === "string" ? Buffer.from(chunk) : Buffer.from(chunk);
-      if (received + buf.length > maxBytes) {
-        chunks.push(buf.subarray(0, maxBytes - received));
-        received = maxBytes;
-        truncated = true;
-        try { ac.abort(); } catch {}
-        break;
-      }
-      chunks.push(buf);
-      received += buf.length;
-    }
-    const buffer = Buffer.concat(chunks);
-
-    const textual = isTextual(contentType);
-    const body_encoding = textual ? "text" : "base64";
-    const body_out = textual ? buffer.toString("utf8") : buffer.toString("base64");
-
-    return {
-      url: u.toString(),
-      status: res.statusCode,
-      status_text: (res as any).statusMessage ?? "",
-      headers: respHeaders,
-      content_type: contentType,
-      content_length: contentLength ?? buffer.length,
-      body_encoding,
-      body: body_out,
-      body_truncated: truncated,
-      redirects: (res as any).redirections?.map((r: URL) => r.toString()) ?? [],
-      duration_ms: Date.now() - t0,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
+import { doRequest, createSession, closeSession, listSessions, type RequestSpec } from "./http.js";
+import { clientCredentials, refreshToken, deviceStart, devicePoll, listCachedTokens, clearTokenCache } from "./oauth2.js";
+import { toCurl } from "./curl.js";
 
 function textContent(data: unknown) {
   const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
   return { content: [{ type: "text" as const, text }] };
 }
-
 function errContent(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], isError: true };
 }
 
-const server = new McpServer({ name: "http", version: "0.1.0" });
+const server = new McpServer({ name: "http", version: "0.2.0" });
 
 server.tool(
   "http",
-  `Make HTTP requests. Structured response includes status, headers (lowercased), content-type, and body.
+  `HTTP client for LLMs. curl-equivalent + OAuth2 + sessions + retry.
 
-Response body:
-- Textual types (text/*, application/json, +json/+xml, form-urlencoded, yaml, graphql) → decoded UTF-8 string (body_encoding: "text")
-- Binary types → base64 (body_encoding: "base64")
-- Body is capped at HTTP_MAX_BODY bytes (default 2 MiB). body_truncated: true when cut.
+Response bodies: textual types decoded as UTF-8; binary types base64-encoded; capped at HTTP_MAX_BODY (default 2 MiB) with body_truncated flag. status >= 400 sets MCP isError.
 
-Body selection (choose one):
-- json: any JSON-serializable value → sends as application/json
-- form: object → sends as application/x-www-form-urlencoded
-- body: raw string body
-- body_base64: raw binary body (base64)
+BODY SELECTION (choose one per request): json | form | body | body_base64.
 
-Auth shortcuts:
-- basic_auth: { user, password } → Authorization: Basic ...
-- bearer: token → Authorization: Bearer ...
-Custom headers override both.
+AUTH: basic_auth | bearer | oauth2_* flows that cache tokens and can feed into 'bearer' of a subsequent request.
 
-Redirects are followed by default (max 5). Disable with follow_redirects: false.
+SESSIONS: cookie jars keyed by session id. Pass 'session' on request/get/post/etc to send and store cookies per domain. Manage with session_create / session_list / session_close.
+
+RETRY: retry={max, on_status, backoff_ms, max_backoff_ms}. Exponential backoff on transient 5xx by default.
 
 Actions:
-- request: full-power request (method, url, headers, body variants, query, auth, timeout, follow_redirects).
-- get / post / put / delete / patch / head: shortcuts that set method.
-- download: GET + write response body to path. Returns {path, bytes, status}.`,
+- request / get / post / put / delete / patch / head: HTTP requests.
+- download: GET + write to output_path.
+- as_curl: convert a request spec to a cURL command string. shell = bash | cmd | powershell.
+- session_create / session_close / session_list: cookie jar lifecycle.
+- oauth2_client_credentials: machine-to-machine. Returns {access_token, expires_in, ...}. Caches by (token_url, client_id, scope). Subsequent calls reuse until 30s before expiry.
+- oauth2_refresh: refresh_token grant.
+- oauth2_device_start: start device authorization flow. Returns {device_code, user_code, verification_uri, expires_in, interval}.
+- oauth2_device_poll: poll token endpoint until authorized / expired / denied. Blocks up to max_wait_seconds (default 120). Returns {status: authorized|pending|expired|denied, ...}.
+- oauth2_list_tokens / oauth2_clear_cache.`,
   {
-    action: z.enum(["request", "get", "post", "put", "delete", "patch", "head", "download"]).describe("Action to perform"),
-    url: z.string().describe("Request URL (may include querystring)"),
-    method: z.string().optional().describe("HTTP method (request action)"),
-    headers: z.record(z.string()).optional().describe("Request headers (lowercased in response)"),
-    query: z.record(z.union([z.string(), z.number(), z.boolean(), z.array(z.union([z.string(), z.number()]))])).optional().describe("Appended to URL querystring"),
-    body: z.string().optional().describe("Raw string body"),
-    body_base64: z.string().optional().describe("Raw binary body as base64"),
-    json: z.unknown().optional().describe("JSON body (sets content-type)"),
-    form: z.record(z.string()).optional().describe("Form-urlencoded body"),
-    basic_auth: z.object({ user: z.string(), password: z.string() }).optional().describe("Basic auth"),
-    bearer: z.string().optional().describe("Bearer token"),
-    timeout: z.number().optional().describe("Per-call timeout ms (default HTTP_TIMEOUT)"),
-    follow_redirects: z.boolean().optional().describe("Follow redirects (default true)"),
-    max_redirects: z.number().optional().describe("Max redirect chain length (default 5)"),
-    reject_unauthorized: z.boolean().optional().describe("TLS cert verification (default true). Set false for self-signed."),
-    max_body_bytes: z.number().optional().describe("Cap response body bytes (default HTTP_MAX_BODY=2MiB)"),
-    output_path: z.string().optional().describe("download: write body to this path"),
+    action: z.enum([
+      "request", "get", "post", "put", "delete", "patch", "head",
+      "download", "as_curl",
+      "session_create", "session_close", "session_list",
+      "oauth2_client_credentials", "oauth2_refresh",
+      "oauth2_device_start", "oauth2_device_poll",
+      "oauth2_list_tokens", "oauth2_clear_cache",
+    ]).describe("Action"),
+    // request shape
+    url: z.string().optional(),
+    method: z.string().optional(),
+    headers: z.record(z.string()).optional(),
+    query: z.record(z.union([z.string(), z.number(), z.boolean(), z.array(z.union([z.string(), z.number()]))])).optional(),
+    body: z.string().optional(),
+    body_base64: z.string().optional(),
+    json: z.unknown().optional(),
+    form: z.record(z.string()).optional(),
+    basic_auth: z.object({ user: z.string(), password: z.string() }).optional(),
+    bearer: z.string().optional(),
+    timeout: z.number().optional(),
+    follow_redirects: z.boolean().optional(),
+    max_redirects: z.number().optional(),
+    reject_unauthorized: z.boolean().optional(),
+    max_body_bytes: z.number().optional(),
+    session: z.string().optional().describe("Session id to send/store cookies"),
+    retry: z.object({
+      max: z.number().optional(),
+      on_status: z.array(z.number()).optional(),
+      backoff_ms: z.number().optional(),
+      max_backoff_ms: z.number().optional(),
+    }).optional(),
+    output_path: z.string().optional().describe("download: destination path"),
+    shell: z.enum(["bash", "cmd", "powershell"]).optional().describe("as_curl: target shell syntax (default bash)"),
+    // session
+    session_id: z.string().optional().describe("session_create (optional name) / session_close"),
+    // oauth2
+    token_url: z.string().optional(),
+    device_authorization_url: z.string().optional(),
+    client_id: z.string().optional(),
+    client_secret: z.string().optional(),
+    scope: z.string().optional(),
+    audience: z.string().optional(),
+    refresh_token: z.string().optional(),
+    device_code: z.string().optional(),
+    auth_method: z.enum(["basic", "form"]).optional(),
+    use_cache: z.boolean().optional(),
+    max_wait_seconds: z.number().optional(),
+    initial_interval: z.number().optional(),
+    extra_params: z.record(z.string()).optional(),
   },
   async (p) => {
     try {
-      const method = p.action === "request" ? (p.method ?? "GET") :
-        p.action === "download" ? "GET" :
-        p.action.toUpperCase();
-      const res = await doRequest({ ...p, method });
-      if (p.action === "download") {
-        if (!p.output_path) return errContent("download requires 'output_path'");
-        const { writeFileSync } = await import("node:fs");
-        const buf = res.body_encoding === "base64"
-          ? Buffer.from(res.body, "base64")
-          : Buffer.from(res.body, "utf8");
-        writeFileSync(p.output_path, buf);
+      const httpActions = ["request", "get", "post", "put", "delete", "patch", "head", "download"];
+      if (httpActions.includes(p.action)) {
+        if (!p.url) return errContent(`${p.action} requires 'url'`);
+        const method = p.action === "request" ? (p.method ?? "GET")
+          : p.action === "download" ? "GET"
+          : p.action.toUpperCase();
+        const spec: RequestSpec = { ...p, method, url: p.url };
+        const res = await doRequest(spec);
+        if (p.action === "download") {
+          if (!p.output_path) return errContent("download requires 'output_path'");
+          const buf = res.body_encoding === "base64" ? Buffer.from(res.body, "base64") : Buffer.from(res.body, "utf8");
+          writeFileSync(p.output_path, buf);
+          return textContent({
+            path: p.output_path, bytes: buf.length, status: res.status,
+            content_type: res.content_type, url: res.url, duration_ms: res.duration_ms,
+            attempts: res.attempts,
+          });
+        }
+        const resp = textContent(res);
+        if (res.status >= 400) (resp as any).isError = true;
+        return resp;
+      }
+
+      if (p.action === "as_curl") {
+        if (!p.url) return errContent("as_curl requires 'url'");
+        const cmd = toCurl({ ...p, url: p.url } as RequestSpec, p.shell ?? "bash");
+        return textContent({ command: cmd, shell: p.shell ?? "bash" });
+      }
+
+      if (p.action === "session_create") return textContent(createSession(p.session_id));
+      if (p.action === "session_close") {
+        if (!p.session_id) return errContent("session_close requires 'session_id'");
+        return textContent(closeSession(p.session_id));
+      }
+      if (p.action === "session_list") return textContent({ count: listSessions().length, sessions: listSessions() });
+
+      if (p.action === "oauth2_client_credentials") {
+        if (!p.token_url || !p.client_id || !p.client_secret) return errContent("oauth2_client_credentials requires token_url, client_id, client_secret");
+        const t = await clientCredentials({
+          token_url: p.token_url, client_id: p.client_id, client_secret: p.client_secret,
+          scope: p.scope, audience: p.audience,
+          auth_method: p.auth_method, extra_params: p.extra_params, use_cache: p.use_cache,
+        });
         return textContent({
-          path: p.output_path,
-          bytes: buf.length,
-          status: res.status,
-          content_type: res.content_type,
-          url: res.url,
-          duration_ms: res.duration_ms,
+          access_token: t.access_token, token_type: t.token_type ?? "Bearer",
+          expires_in_s: Math.max(0, Math.round((t.expires_at - Date.now()) / 1000)),
+          scope: t.scope, refresh_token: t.refresh_token,
         });
       }
-      const response: any = { ...res };
-      if (res.status >= 400) response._note = `HTTP ${res.status} — response marked isError`;
-      const mcp = textContent(response);
-      if (res.status >= 400) (mcp as any).isError = true;
-      return mcp;
+      if (p.action === "oauth2_refresh") {
+        if (!p.token_url || !p.client_id || !p.refresh_token) return errContent("oauth2_refresh requires token_url, client_id, refresh_token");
+        const t = await refreshToken({
+          token_url: p.token_url, client_id: p.client_id, client_secret: p.client_secret,
+          refresh_token: p.refresh_token, scope: p.scope, auth_method: p.auth_method,
+        });
+        return textContent({
+          access_token: t.access_token, token_type: t.token_type ?? "Bearer",
+          expires_in_s: Math.max(0, Math.round((t.expires_at - Date.now()) / 1000)),
+          scope: t.scope, refresh_token: t.refresh_token,
+        });
+      }
+      if (p.action === "oauth2_device_start") {
+        if (!p.device_authorization_url || !p.client_id) return errContent("oauth2_device_start requires device_authorization_url, client_id");
+        return textContent(await deviceStart({
+          device_authorization_url: p.device_authorization_url,
+          client_id: p.client_id, scope: p.scope, audience: p.audience,
+          extra_params: p.extra_params,
+        }));
+      }
+      if (p.action === "oauth2_device_poll") {
+        if (!p.token_url || !p.client_id || !p.device_code) return errContent("oauth2_device_poll requires token_url, client_id, device_code");
+        const r = await devicePoll({
+          token_url: p.token_url, client_id: p.client_id, client_secret: p.client_secret,
+          device_code: p.device_code,
+          max_wait_seconds: p.max_wait_seconds, initial_interval: p.initial_interval,
+        });
+        if (r.status === "authorized") {
+          return textContent({
+            status: "authorized",
+            access_token: r.token.access_token,
+            expires_in_s: Math.max(0, Math.round((r.token.expires_at - Date.now()) / 1000)),
+            scope: r.token.scope, refresh_token: r.token.refresh_token,
+          });
+        }
+        const resp = textContent(r);
+        if (r.status === "denied" || r.status === "expired") (resp as any).isError = true;
+        return resp;
+      }
+      if (p.action === "oauth2_list_tokens") return textContent({ tokens: listCachedTokens() });
+      if (p.action === "oauth2_clear_cache") return textContent(clearTokenCache());
+
+      return errContent(`unknown action: ${p.action}`);
     } catch (err: any) {
       return errContent(`HTTP error: ${err?.message ?? String(err)}${err?.cause?.message ? ` (cause: ${err.cause.message})` : ""}`);
     }
@@ -259,7 +198,4 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+main().catch((err) => { console.error("Fatal:", err); process.exit(1); });

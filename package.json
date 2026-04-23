@@ -1,6 +1,6 @@
 {
   "name": "http-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP stdio server for HTTP requests — curl-equivalent functionality via Node's undici/fetch with structured responses",
   "type": "module",
   "main": "dist/index.js",
@@ -10,10 +10,12 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "zod": "^3.23.8",
-    "undici": "^7.0.0"
+    "undici": "^7.0.0",
+    "tough-cookie": "^5.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/tough-cookie": "^4.0.5",
     "typescript": "^5.7.0"
   }
 }

@@ -10,7 +10,7 @@
 [![MCP](https://img.shields.io/badge/MCP-stdio-6E56CF?style=flat)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat)](LICENSE)
 
-**API テスト・ヘッダ確認・Basic/Bearer 認証・リダイレクト追跡を一撃で。**
+**API テスト・OAuth2 フル対応・セッションクッキー・リトライ・curl コマンド生成を一撃で。**
 
 ---
 
@@ -20,13 +20,45 @@
 
 curl 相当の機能を **undici 直叩き**で提供する。レスポンスボディは content-type に応じて**テキスト decode か base64 encode を自動選択**し、2 MiB で自動 truncate。ヘッダは全て小文字化して返す。
 
+v0.2 では**実用で詰まる所**を埋めた: OAuth2 の主要 3 フロー (client_credentials / refresh / device flow) をトークンキャッシュ付きで、セッションクッキー (tough-cookie) で複数リクエストを跨ぐ状態保持、5xx 指数バックオフリトライ、任意リクエストを cURL コマンド文字列に変換。
+
 ## 特徴
+
+### HTTP リクエスト
 
 | アクション | 用途 |
 |---|---|
-| `request` | フル機能（`method` / `headers` / `body` / `json` / `form` / `query` / 認証 / リダイレクト制御） |
+| `request` | フル機能（`method` / `headers` / `body` / `json` / `form` / `query` / 認証 / リダイレクト制御 / retry / session） |
 | `get` / `post` / `put` / `delete` / `patch` / `head` | `method` だけ固定したショートカット |
 | `download` | GET してレスポンスを `output_path` に書き出す。バイナリも OK |
+| `as_curl` | リクエスト仕様から cURL コマンド文字列を生成 (`shell: bash | cmd | powershell`) |
+
+### セッション (Cookie jar)
+
+| アクション | 用途 |
+|---|---|
+| `session_create` | セッションを作成、ID を返す (`session_id` オプション指定可) |
+| `session_close` | セッション破棄 |
+| `session_list` | 現在アクティブなセッション一覧 |
+
+リクエスト系アクションで `session: <id>` を指定すると、そのセッションの Cookie jar を使って送受信する (tough-cookie ベース)。
+
+### OAuth2
+
+| アクション | 用途 |
+|---|---|
+| `oauth2_client_credentials` | machine-to-machine (M2M) フロー。`basic` / `form` 認証方式対応、scope/audience 付与可、デフォルトで token キャッシュ (`use_cache: false` で無効化) |
+| `oauth2_refresh` | refresh_token フロー |
+| `oauth2_device_start` | デバイス認可フロー開始。`device_code` / `user_code` / `verification_uri` / `interval` を返す |
+| `oauth2_device_poll` | 認可待ちをポーリング (`max_wait_seconds` デフォルト 120、`initial_interval` 秒刻み)。`authorized` / `pending` / `expired` / `denied` |
+| `oauth2_list_tokens` | キャッシュ済みトークンの一覧（expires_in_s 付き） |
+| `oauth2_clear_cache` | トークンキャッシュ全消去 |
+
+トークンは `(token_url, client_id, scope)` でキャッシュ、有効期限の 30 秒前まで再利用。取得した `access_token` を次のリクエストで `bearer: ...` に渡せば認証済みリクエストが打てる。
+
+### リトライ
+
+`retry: {max, on_status, backoff_ms, max_backoff_ms}` を渡すと指数バックオフ (`min(max_backoff_ms, backoff_ms * 2^n)`) でリトライ。デフォルト `on_status: [502, 503, 504]`。レスポンスに `attempts` と `retried_on[]` が入る。
 
 ## インストール
 
@@ -60,14 +92,61 @@ JSON POST + Bearer 認証:
  "bearer": "sk-...", "json": {"name": "hello"}}
 ```
 
-Form + Query + Basic auth:
+OAuth2 client_credentials で取ったトークンで API を叩く:
 
 ```json
-{"action": "request", "url": "https://httpbin.org/post",
- "method": "POST",
- "query": {"debug": true},
- "form": {"k": "v"},
- "basic_auth": {"user": "u", "password": "p"}}
+{"action": "oauth2_client_credentials",
+ "token_url": "https://auth.example.com/oauth/token",
+ "client_id": "...", "client_secret": "...",
+ "scope": "read:users"}
+```
+レスポンスの `access_token` を次の呼び出しの `bearer` に渡す:
+```json
+{"action": "get", "url": "https://api.example.com/users",
+ "bearer": "<access_token>"}
+```
+
+OAuth2 デバイス認可フロー (GitHub CLI / Google OAuth 等):
+
+```json
+{"action": "oauth2_device_start",
+ "device_authorization_url": "https://github.com/login/device/code",
+ "client_id": "Iv1.xxx",
+ "scope": "repo"}
+```
+`user_code` をユーザーに提示し、ブラウザで認証してもらってから:
+```json
+{"action": "oauth2_device_poll",
+ "token_url": "https://github.com/login/oauth/access_token",
+ "client_id": "Iv1.xxx",
+ "device_code": "<device_code>",
+ "max_wait_seconds": 180}
+```
+
+Cookie jar を使った複数リクエストの状態保持:
+
+```json
+{"action": "session_create"}
+// → {"id": "s_..."}
+{"action": "post", "session": "s_...", "url": "https://example.com/login", "form": {"u":"u","p":"p"}}
+{"action": "get",  "session": "s_...", "url": "https://example.com/dashboard"}
+```
+
+5xx に指数バックオフでリトライ:
+
+```json
+{"action": "get", "url": "https://flaky.example.com/api",
+ "retry": {"max": 3, "on_status": [502, 503, 504],
+           "backoff_ms": 500, "max_backoff_ms": 10000}}
+```
+
+リクエスト仕様を cURL コマンドに変換してターミナルで再現:
+
+```json
+{"action": "as_curl", "shell": "bash",
+ "url": "https://api.example.com/v1/items",
+ "method": "POST", "bearer": "sk-abc",
+ "json": {"name": "hello"}}
 ```
 
 バイナリダウンロード:
