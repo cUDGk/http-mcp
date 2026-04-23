@@ -1,6 +1,6 @@
 {
   "name": "http-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP stdio server for HTTP requests — curl-equivalent functionality via Node's undici/fetch with structured responses",
   "type": "module",
   "main": "dist/index.js",

@@ -179,6 +179,15 @@ Cookie jar を使った複数リクエストの状態保持:
 
 `reject_unauthorized: false` は**自己署名証明書を無条件で受け入れる**。MITM リスクがあるので本番 API には使わない。`basic_auth` / `bearer` は**ログには残らない**が、MCP の上位ログに残る可能性はあるので、本物の認証情報を安易に LLM プロンプトに載せない。
 
+## v0.2.1 修正
+
+一部の MCP クライアント (Claude Code の LLM ツール使用パス等) が**オブジェクト引数を JSON 文字列化してからサーバーに渡す**挙動があり、`json` パラメータが二重エンコードされて送信先 (例: Discord Webhook) が「dictionary が期待された」と 400 を返す問題があった。
+
+修正内容:
+- `headers` / `form` / `basic_auth` / `query` / `retry` / `extra_params` の zod schema を `z.union([<本来の型>, z.string()])` に緩和
+- `coerceObject()` ヘルパを追加し、文字列で届いた場合は `JSON.parse` で object に戻してから使用
+- `json` パラメータは文字列を受けたら先に `JSON.parse` して、本来のボディ形状で再シリアライズ (二重エンコード防止)
+
 ## Attribution
 
 - [undici](https://github.com/nodejs/undici) — Node.js の HTTP/1.1 クライアント

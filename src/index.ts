@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Buffer } from "node:buffer";
 import { writeFileSync } from "node:fs";
 import { z } from "zod";
-import { doRequest, createSession, closeSession, listSessions, type RequestSpec } from "./http.js";
+import { doRequest, createSession, closeSession, listSessions, coerceObject, type RequestSpec } from "./http.js";
 import { clientCredentials, refreshToken, deviceStart, devicePoll, listCachedTokens, clearTokenCache } from "./oauth2.js";
 import { toCurl } from "./curl.js";
 
@@ -16,7 +16,7 @@ function errContent(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], isError: true };
 }
 
-const server = new McpServer({ name: "http", version: "0.2.0" });
+const server = new McpServer({ name: "http", version: "0.2.1" });
 
 server.tool(
   "http",
@@ -54,13 +54,18 @@ Actions:
     // request shape
     url: z.string().optional(),
     method: z.string().optional(),
-    headers: z.record(z.string()).optional(),
-    query: z.record(z.union([z.string(), z.number(), z.boolean(), z.array(z.union([z.string(), z.number()]))])).optional(),
+    // object-typed args accept a JSON-encoded string too — some MCP clients
+    // serialize objects/arrays before sending, and we unwrap at runtime.
+    headers: z.union([z.record(z.string()), z.string()]).optional(),
+    query: z.union([
+      z.record(z.union([z.string(), z.number(), z.boolean(), z.array(z.union([z.string(), z.number()]))])),
+      z.string(),
+    ]).optional(),
     body: z.string().optional(),
     body_base64: z.string().optional(),
     json: z.unknown().optional(),
-    form: z.record(z.string()).optional(),
-    basic_auth: z.object({ user: z.string(), password: z.string() }).optional(),
+    form: z.union([z.record(z.string()), z.string()]).optional(),
+    basic_auth: z.union([z.object({ user: z.string(), password: z.string() }), z.string()]).optional(),
     bearer: z.string().optional(),
     timeout: z.number().optional(),
     follow_redirects: z.boolean().optional(),
@@ -68,12 +73,12 @@ Actions:
     reject_unauthorized: z.boolean().optional(),
     max_body_bytes: z.number().optional(),
     session: z.string().optional().describe("Session id to send/store cookies"),
-    retry: z.object({
+    retry: z.union([z.object({
       max: z.number().optional(),
       on_status: z.array(z.number()).optional(),
       backoff_ms: z.number().optional(),
       max_backoff_ms: z.number().optional(),
-    }).optional(),
+    }), z.string()]).optional(),
     output_path: z.string().optional().describe("download: destination path"),
     shell: z.enum(["bash", "cmd", "powershell"]).optional().describe("as_curl: target shell syntax (default bash)"),
     // session
@@ -91,7 +96,7 @@ Actions:
     use_cache: z.boolean().optional(),
     max_wait_seconds: z.number().optional(),
     initial_interval: z.number().optional(),
-    extra_params: z.record(z.string()).optional(),
+    extra_params: z.union([z.record(z.string()), z.string()]).optional(),
   },
   async (p) => {
     try {
@@ -136,7 +141,7 @@ Actions:
         const t = await clientCredentials({
           token_url: p.token_url, client_id: p.client_id, client_secret: p.client_secret,
           scope: p.scope, audience: p.audience,
-          auth_method: p.auth_method, extra_params: p.extra_params, use_cache: p.use_cache,
+          auth_method: p.auth_method, extra_params: coerceObject<Record<string, string>>(p.extra_params), use_cache: p.use_cache,
         });
         return textContent({
           access_token: t.access_token, token_type: t.token_type ?? "Bearer",
@@ -161,7 +166,7 @@ Actions:
         return textContent(await deviceStart({
           device_authorization_url: p.device_authorization_url,
           client_id: p.client_id, scope: p.scope, audience: p.audience,
-          extra_params: p.extra_params,
+          extra_params: coerceObject<Record<string, string>>(p.extra_params),
         }));
       }
       if (p.action === "oauth2_device_poll") {

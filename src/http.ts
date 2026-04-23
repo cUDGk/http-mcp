@@ -49,13 +49,15 @@ export type Resp = {
 export type RequestSpec = {
   url: string;
   method?: string;
-  headers?: Record<string, string>;
+  // All object-typed fields accept a JSON-encoded string fallback; the helper
+  // coerceObject() unwraps them at runtime.
+  headers?: Record<string, string> | string;
   body?: string;
   body_base64?: string;
   json?: unknown;
-  form?: Record<string, string>;
-  query?: Record<string, string | number | boolean | (string | number)[]>;
-  basic_auth?: { user: string; password: string };
+  form?: Record<string, string> | string;
+  query?: Record<string, string | number | boolean | (string | number)[]> | string;
+  basic_auth?: { user: string; password: string } | string;
   bearer?: string;
   timeout?: number;
   follow_redirects?: boolean;
@@ -68,7 +70,7 @@ export type RequestSpec = {
     on_status?: number[];
     backoff_ms?: number;
     max_backoff_ms?: number;
-  };
+  } | string;
 };
 
 function headersToObject(h: Record<string, string | string[] | undefined>): Record<string, string> {
@@ -84,6 +86,26 @@ export function basicAuth(user: string, pass: string): string {
   return "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
 }
 
+/**
+ * Some MCP clients (notably Claude Code LLM tool-use path) marshal object /
+ * array arguments to JSON strings before they reach the server, even when the
+ * tool schema declares them as objects. This helper accepts either the
+ * original value or a JSON-encoded string that parses back to an object /
+ * array, so the rest of the code can work uniformly.
+ */
+export function coerceObject<T>(val: unknown): T | undefined {
+  if (val === undefined || val === null) return undefined;
+  if (typeof val === "string") {
+    try {
+      const parsed = JSON.parse(val);
+      if (parsed !== null && typeof parsed === "object") return parsed as T;
+    } catch {}
+    return undefined;
+  }
+  if (typeof val === "object") return val as T;
+  return undefined;
+}
+
 function isTextual(contentType: string | null): boolean {
   if (!contentType) return false;
   return TEXTUAL.test(contentType.toLowerCase());
@@ -91,10 +113,11 @@ function isTextual(contentType: string | null): boolean {
 
 export function buildUrl(url: string, query?: RequestSpec["query"]): URL {
   const u = new URL(url);
-  if (query) {
-    for (const [k, v] of Object.entries(query)) {
+  const q = coerceObject<Record<string, unknown>>(query as any);
+  if (q) {
+    for (const [k, v] of Object.entries(q)) {
       if (Array.isArray(v)) for (const vv of v) u.searchParams.append(k, String(vv));
-      else u.searchParams.append(k, String(v));
+      else if (v !== undefined && v !== null) u.searchParams.append(k, String(v));
     }
   }
   return u;
@@ -108,16 +131,29 @@ export function resolveHeadersAndBody(p: RequestSpec): {
     "user-agent": USER_AGENT,
     accept: "*/*",
   };
-  if (p.headers) for (const [k, v] of Object.entries(p.headers)) headers[k.toLowerCase()] = v;
-  if (p.basic_auth) headers["authorization"] = basicAuth(p.basic_auth.user, p.basic_auth.password);
+  const incomingHeaders = coerceObject<Record<string, string>>(p.headers);
+  if (incomingHeaders) for (const [k, v] of Object.entries(incomingHeaders)) headers[k.toLowerCase()] = String(v);
+  const basic = coerceObject<{ user: string; password: string }>(p.basic_auth);
+  if (basic) headers["authorization"] = basicAuth(basic.user, basic.password);
   if (p.bearer) headers["authorization"] = `Bearer ${p.bearer}`;
 
   let body: string | Buffer | undefined;
   if (p.json !== undefined) {
-    body = JSON.stringify(p.json);
+    // Defensive: MCP clients sometimes JSON-encode object args before send.
+    // If p.json arrived as a stringified JSON object/array, unwrap it so
+    // the stringify below doesn't double-encode the body.
+    let val: unknown = p.json;
+    if (typeof val === "string") {
+      try {
+        const parsed = JSON.parse(val);
+        if (parsed !== null && typeof parsed === "object") val = parsed;
+      } catch {}
+    }
+    body = JSON.stringify(val);
     if (!headers["content-type"]) headers["content-type"] = "application/json";
   } else if (p.form) {
-    body = new URLSearchParams(p.form).toString();
+    const f = coerceObject<Record<string, string>>(p.form);
+    body = f ? new URLSearchParams(f).toString() : "";
     if (!headers["content-type"]) headers["content-type"] = "application/x-www-form-urlencoded";
   } else if (p.body_base64 !== undefined) {
     body = Buffer.from(p.body_base64, "base64");
@@ -220,7 +256,8 @@ async function doRequestOnce(p: RequestSpec, attempt: number): Promise<Resp> {
 }
 
 export async function doRequest(p: RequestSpec): Promise<Resp> {
-  const retry = p.retry;
+  type RetryOpts = { max?: number; on_status?: number[]; backoff_ms?: number; max_backoff_ms?: number };
+  const retry = coerceObject<RetryOpts>(p.retry as any);
   if (!retry || !(retry.max && retry.max > 0)) {
     return doRequestOnce(p, 1);
   }
