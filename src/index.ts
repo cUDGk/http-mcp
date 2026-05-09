@@ -134,7 +134,11 @@ Actions:
         if (!p.session_id) return errContent("session_close requires 'session_id'");
         return textContent(closeSession(p.session_id));
       }
-      if (p.action === "session_list") return textContent({ count: listSessions().length, sessions: listSessions() });
+      if (p.action === "session_list") {
+        // B5: snapshot once — listSessions() runs eviction and could differ between calls.
+        const s = listSessions();
+        return textContent({ count: s.length, sessions: s });
+      }
 
       if (p.action === "oauth2_client_credentials") {
         if (!p.token_url || !p.client_id || !p.client_secret) return errContent("oauth2_client_credentials requires token_url, client_id, client_secret");
@@ -185,18 +189,49 @@ Actions:
           });
         }
         const resp = textContent(r);
-        if (r.status === "denied" || r.status === "expired") (resp as any).isError = true;
+        if (r.status === "denied" || r.status === "expired" || r.status === "error") resp.isError = true;
         return resp;
       }
       if (p.action === "oauth2_list_tokens") return textContent({ tokens: listCachedTokens() });
       if (p.action === "oauth2_clear_cache") return textContent(clearTokenCache());
 
       return errContent(`unknown action: ${p.action}`);
-    } catch (err: any) {
-      return errContent(`HTTP error: ${err?.message ?? String(err)}${err?.cause?.message ? ` (cause: ${err.cause.message})` : ""}`);
+    } catch (err: unknown) {
+      const e = err as { message?: string; stack?: string; cause?: { message?: string }; oauth_error?: unknown } | undefined;
+      // U5: log full diagnostic detail (cause, stack) to stderr; keep user-facing
+      // message minimal to avoid leaking internal error chains via the LLM channel.
+      if (e?.cause?.message || e?.stack) {
+        process.stderr.write(`[http-mcp] error: ${e?.stack ?? e?.message ?? String(err)}${e?.cause?.message ? ` (cause: ${e.cause.message})` : ""}\n`);
+      }
+      // U6: surface structured oauth_error if present
+      if (e?.oauth_error) {
+        return errContent(`HTTP error: ${e?.message ?? String(err)}\noauth_error: ${JSON.stringify(e.oauth_error)}`);
+      }
+      return errContent(`HTTP error: ${e?.message ?? String(err)}`);
     }
   },
 );
+
+async function shutdown(reason: string): Promise<void> {
+  process.stderr.write(`[http-mcp] shutting down: ${reason}\n`);
+  try { await closeGlobalAgents(); } catch (e) {
+    process.stderr.write(`[http-mcp] agent close failed: ${(e as Error).message}\n`);
+  }
+  try { await server.close(); } catch (e) {
+    process.stderr.write(`[http-mcp] server close failed: ${(e as Error).message}\n`);
+  }
+}
+
+// B19: graceful shutdown
+process.on("SIGTERM", () => { void shutdown("SIGTERM").finally(() => process.exit(0)); });
+process.on("SIGINT", () => { void shutdown("SIGINT").finally(() => process.exit(0)); });
+// U10
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`[http-mcp] unhandledRejection: ${(err as Error)?.stack ?? String(err)}\n`);
+});
+process.on("uncaughtException", (err) => {
+  process.stderr.write(`[http-mcp] uncaughtException: ${err.stack ?? String(err)}\n`);
+});
 
 async function main() {
   const transport = new StdioServerTransport();

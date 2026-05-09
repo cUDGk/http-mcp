@@ -3,8 +3,11 @@ import { buildUrl, resolveHeadersAndBody } from "./http.js";
 
 function shellQuote(s: string, shell: "bash" | "cmd" | "powershell"): string {
   if (shell === "cmd") {
-    // wrap in double quotes, escape " and %
-    return `"${s.replace(/"/g, '\\"').replace(/%/g, "%%")}"`;
+    // U8: cmd.exe escapes embedded quotes by doubling, not via backslash.
+    // Caveat: shell quoting in cmd is fundamentally fragile — we wrap in
+    // double quotes, double existing quotes and any literal `%` to defang
+    // delayed-expansion. Treat as best-effort.
+    return `"${s.replace(/"/g, '""').replace(/%/g, "%%")}"`;
   }
   if (shell === "powershell") {
     // wrap in single quotes, escape '' (double single quotes)

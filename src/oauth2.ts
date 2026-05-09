@@ -216,11 +216,9 @@ export async function clientCredentials(p: {
     basic_auth: authMethod === "basic" ? { user: p.client_id, password: p.client_secret } : undefined,
   });
   if (res.status < 200 || res.status >= 300) {
-    throw new Error(`OAuth2 client_credentials failed: HTTP ${res.status} ${res.body.slice(0, 300)}`);
+    throw makeError(res, "OAuth2 client_credentials failed");
   }
-  let tok: TokenResponse;
-  try { tok = JSON.parse(res.body); } catch { throw new Error(`OAuth2 token response was not JSON: ${res.body.slice(0, 200)}`); }
-  if (!tok.access_token) throw new Error(`OAuth2 response missing access_token: ${res.body.slice(0, 200)}`);
+  const tok = parseTokenResponse(res);
   return cacheToken(key, tok);
 }
 
@@ -251,10 +249,21 @@ export async function refreshToken(p: {
     basic_auth: authMethod === "basic" && p.client_secret ? { user: p.client_id, password: p.client_secret } : undefined,
   });
   if (res.status < 200 || res.status >= 300) {
-    throw new Error(`OAuth2 refresh failed: HTTP ${res.status} ${res.body.slice(0, 300)}`);
+    throw makeError(res, "OAuth2 refresh failed");
   }
-  const tok = JSON.parse(res.body) as TokenResponse;
-  const key = cacheKey({ flow: "refresh", token_url: p.token_url, client_id: p.client_id });
+  const tok = parseTokenResponse(res);
+  // B4: previous key omitted both `scope` and the refresh_token fingerprint, so
+  // a second refresh request with a different refresh_token (e.g. after a
+  // rotation) or different scope subset would alias the old cache entry and
+  // hand back a stale access token.
+  const key = cacheKey({
+    flow: "refresh",
+    token_url: p.token_url,
+    client_id: p.client_id,
+    secret_fp: secretFingerprint(p.client_secret),
+    scope: p.scope,
+    rt_fp: secretFingerprint(p.refresh_token),
+  });
   return cacheToken(key, tok);
 }
 
@@ -333,24 +342,54 @@ export async function devicePoll(p: {
       form,
       headers: { accept: "application/json" },
     });
-    const body = (() => { try { return JSON.parse(res.body); } catch { return {}; } })();
-    if (res.status === 200 && body.access_token) {
-      const key = cacheKey({ flow: "device", token_url: p.token_url, client_id: p.client_id });
-      return { status: "authorized", token: cacheToken(key, body) };
+    let body: unknown = {};
+    try { body = parseJsonBody(res); } catch { body = {}; }
+    const bodyObj = body !== null && typeof body === "object" ? body as Record<string, unknown> : {};
+    if (res.status === 200 && typeof bodyObj.access_token === "string") {
+      const parsed = TokenResponseSchema.safeParse(body);
+      if (!parsed.success) {
+        return { status: "error", error: "invalid_token_response", error_description: parsed.error.message, http_status: res.status };
+      }
+      const key = cacheKey({
+        flow: "device",
+        token_url: p.token_url,
+        client_id: p.client_id,
+        secret_fp: secretFingerprint(p.client_secret),
+      });
+      return { status: "authorized", token: cacheToken(key, parsed.data) };
     }
-    const err = String(body.error ?? "");
+    const err = String(bodyObj.error ?? "");
+    const desc = bodyObj.error_description ? String(bodyObj.error_description) : undefined;
+    // B14: distinguish access_denied vs other errors; surface http_status
     if (err === "authorization_pending") {
       // continue
     } else if (err === "slow_down") {
-      interval += 5000;
+      intervalSec += 5;
     } else if (err === "expired_token") {
       return { status: "expired" };
     } else if (err === "access_denied") {
-      return { status: "denied", error: err, error_description: body.error_description };
+      return { status: "denied", error: err, error_description: desc, http_status: res.status };
     } else if (err) {
-      return { status: "denied", error: err, error_description: body.error_description };
+      return { status: "error", error: err, error_description: desc, http_status: res.status };
+    } else if (res.status >= 400) {
+      return { status: "error", error: `http_${res.status}`, error_description: desc, http_status: res.status };
+    } else if (res.status === 200) {
+      // B5: provider returned 200 with neither access_token nor a recognized
+      // OAuth error code. Without this branch the loop would silently retry
+      // forever (the if-chain falls through to the interval sleep), eating the
+      // entire max_wait_seconds budget against a server that has nothing more
+      // to say. Bail out so the caller sees the malformed response.
+      return {
+        status: "error",
+        error: "unexpected_200",
+        error_description: "200 OK missing access_token and error code",
+        http_status: 200,
+      };
     }
-    await new Promise((r) => setTimeout(r, interval));
+    // B4: clamp sleep to the remaining deadline so we don't oversleep past it.
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(intervalSec * 1000, remaining)));
   }
   return { status: "pending", next_action: "call oauth2_device_poll again with the same device_code" };
 }

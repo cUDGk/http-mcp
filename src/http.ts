@@ -116,6 +116,7 @@ export type Resp = {
   body_encoding: "text" | "base64";
   body: string;
   body_truncated: boolean;
+  aborted_reason?: "timeout" | "max_body";
   redirects: string[];
   duration_ms: number;
   attempts: number;
@@ -172,15 +173,29 @@ export function basicAuth(user: string, pass: string): string {
  * tool schema declares them as objects. This helper accepts either the
  * original value or a JSON-encoded string that parses back to an object /
  * array, so the rest of the code can work uniformly.
+ *
+ * B11: when the input is a string that LOOKS like JSON ('{', '[' first non-ws
+ * char) but does not parse, we throw rather than swallow — silent return of
+ * undefined hides bad input.
  */
 export function coerceObject<T>(val: unknown): T | undefined {
   if (val === undefined || val === null) return undefined;
   if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (trimmed === "") return undefined;
+    const looksJsonShaped = trimmed[0] === "{" || trimmed[0] === "[";
     try {
       const parsed = JSON.parse(val);
       if (parsed !== null && typeof parsed === "object") return parsed as T;
-    } catch {}
-    return undefined;
+      // parsed but not an object/array — caller wanted a structured value
+      if (looksJsonShaped) return undefined;
+      return undefined;
+    } catch (e) {
+      if (looksJsonShaped) {
+        throw new Error(`coerceObject: input looks like JSON but failed to parse: ${(e as Error).message}`);
+      }
+      return undefined;
+    }
   }
   if (typeof val === "object") return val as T;
   return undefined;
@@ -188,12 +203,44 @@ export function coerceObject<T>(val: unknown): T | undefined {
 
 function isTextual(contentType: string | null): boolean {
   if (!contentType) return false;
-  return TEXTUAL.test(contentType.toLowerCase());
+  return TEXTUAL.test(contentType.toLowerCase().trim());
+}
+
+// B6: parse charset / Content-Type label, then BOM sniff, then default.
+function parseCharset(contentType: string | null): string | null {
+  if (!contentType) return null;
+  const m = /charset\s*=\s*"?([^";\s]+)"?/i.exec(contentType);
+  return m && m[1] ? m[1].toLowerCase() : null;
+}
+
+function decodeWithCharset(buf: Buffer, contentType: string | null): { encoding: "text" | "base64"; body: string } {
+  const declared = parseCharset(contentType);
+  // BOM sniff
+  let bomLabel: string | null = null;
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) bomLabel = "utf-8";
+  else if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) bomLabel = "utf-16le";
+  else if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) bomLabel = "utf-16be";
+  const label = declared ?? bomLabel ?? "utf-8";
+  try {
+    // B1/B6: TextDecoder does NOT strip UTF-8 BOM (only UTF-16 ones). Strip
+    // manually whenever the body starts with a UTF-8 BOM AND the effective
+    // label is utf-8 — that includes both "no charset declared" (BOM is the
+    // label source) and "charset=utf-8" declared explicitly. Previously we
+    // only stripped when no charset was declared, leaking the U+FEFF byte
+    // into bodies served as `Content-Type: ...; charset=utf-8`.
+    const stripUtf8Bom = bomLabel === "utf-8" && (declared === null || declared === "utf-8");
+    const slice = stripUtf8Bom ? buf.subarray(3) : buf;
+    const decoder = new TextDecoder(label, { fatal: false });
+    return { encoding: "text", body: decoder.decode(slice) };
+  } catch {
+    // unknown label → fall back to base64
+    return { encoding: "base64", body: buf.toString("base64") };
+  }
 }
 
 export function buildUrl(url: string, query?: RequestSpec["query"]): URL {
   const u = new URL(url);
-  const q = coerceObject<Record<string, unknown>>(query as any);
+  const q = coerceObject<Record<string, unknown>>(query);
   if (q) {
     for (const [k, v] of Object.entries(q)) {
       if (Array.isArray(v)) for (const vv of v) u.searchParams.append(k, String(vv));
@@ -306,7 +353,10 @@ export function resolveHeadersAndBody(p: RequestSpec): {
       try {
         const parsed = JSON.parse(val);
         if (parsed !== null && typeof parsed === "object") val = parsed;
-      } catch {}
+      } catch {
+        // tough-cookie throws on malformed Set-Cookie; here we similarly tolerate
+        // a string that wasn't JSON — treat as a literal string body via JSON.
+      }
     }
     body = JSON.stringify(val);
     if (!headers["content-type"]) headers["content-type"] = "application/json";
@@ -690,8 +740,65 @@ export async function doRequest(p: RequestSpec, opts: RequestOptions = {}): Prom
       lastError = e;
       if (attempt >= maxAttempts) throw e;
     }
-    const delay = Math.min(maxBackoff, backoff * Math.pow(2, attempt - 1));
-    await new Promise((r) => setTimeout(r, delay));
+    // B10: only sleep between attempts, not after the final one
+    if (attempt < maxAttempts) {
+      const delay = Math.min(maxBackoff, backoff * Math.pow(2, attempt - 1));
+      await new Promise((r) => setTimeout(r, delay));
+    }
   }
   throw lastError ?? new Error("retry exhausted");
+}
+
+// U2 / S5: download API — streams to disk, allowlist-checks the path.
+export async function streamDownload(p: RequestSpec & { output_path: string }): Promise<{
+  path: string;
+  bytes: number;
+  status: number;
+  content_type: string | null;
+  url: string;
+  duration_ms: number;
+  attempts: number;
+  truncated: boolean;
+}> {
+  const root = process.env.HTTP_DOWNLOAD_ROOT;
+  if (!root) {
+    throw new Error("download requires HTTP_DOWNLOAD_ROOT env var to be set to an allowlisted directory");
+  }
+  // S5/S6: reject UNC + Windows device-namespace paths, require absolute path under root.
+  const out = p.output_path;
+  if (
+    out.startsWith("\\\\") || out.startsWith("//") ||
+    /^\\\\\?\\/.test(out) || /^\\\\\.\\/.test(out)
+  ) {
+    throw new Error("UNC / device-namespace paths are not allowed for output_path");
+  }
+  if (!isAbsolute(out)) {
+    throw new Error("output_path must be absolute");
+  }
+  const resolvedRoot = pathResolve(root);
+  const resolvedOut = pathResolve(out);
+  const rootWithSep = resolvedRoot.endsWith(pathSep) ? resolvedRoot : resolvedRoot + pathSep;
+  if (resolvedOut !== resolvedRoot && !resolvedOut.startsWith(rootWithSep)) {
+    throw new Error(`output_path is not under HTTP_DOWNLOAD_ROOT (${resolvedRoot})`);
+  }
+  await mkdir(dirname(resolvedOut), { recursive: true });
+  // S3: re-validate after resolving symlinks (mkdir runs first so parent exists)
+  const realRoot = await realpath(resolvedRoot);
+  const realParent = await realpath(dirname(resolvedOut));
+  const realRootSep = realRoot.endsWith(pathSep) ? realRoot : realRoot + pathSep;
+  if (realParent !== realRoot && !realParent.startsWith(realRootSep)) {
+    throw new Error("output_path resolves outside HTTP_DOWNLOAD_ROOT after symlink resolution");
+  }
+  const cap = p.max_body_bytes ?? DOWNLOAD_MAX_BYTES;
+  const res = await doRequest(p, { toFile: { path: resolvedOut, cap } });
+  return {
+    path: resolvedOut,
+    bytes: res.content_length ?? 0,
+    status: res.status,
+    content_type: res.content_type,
+    url: res.url,
+    duration_ms: res.duration_ms,
+    attempts: res.attempts,
+    truncated: res.body_truncated,
+  };
 }
