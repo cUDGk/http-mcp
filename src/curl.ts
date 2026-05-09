@@ -38,15 +38,43 @@ export function toCurl(p: RequestSpec, shell: "bash" | "cmd" | "powershell" = "b
   }
   if (p.follow_redirects !== false) parts.push("-L");
   if (p.reject_unauthorized === false) parts.push("-k");
+  let binaryPipePrefix: string | null = null;
   if (body !== undefined) {
     if (typeof body === "string") {
       parts.push("--data-raw", shellQuote(body, shell));
     } else {
-      // binary body: use base64 inline
+      // U4: emit a reproducible base64 pipe so the command is self-contained.
+      // The base64 pipe shape differs per shell, so guard with a comment first.
+      const b64 = body.toString("base64");
+      lines.push(`# Binary body (${body.length} bytes); the following pipe reconstructs it:`);
+      if (shell === "powershell") {
+        // U13: WARNING — PowerShell does NOT pipe binary bytes byte-faithfully
+        // through `[Convert]::FromBase64String(...) | curl`. Cmdlet-to-native
+        // pipelines stringify each byte and tack on a trailing newline, which
+        // corrupts non-text payloads. The reliable pattern is a temp file:
+        lines.push("# WARNING: piping `[Convert]::FromBase64String(...) | curl` is NOT byte-faithful in PowerShell.");
+        lines.push("# Use an intermediate temp file instead:");
+        lines.push("#   $tmp = [IO.Path]::GetTempFileName()");
+        lines.push(`#   [IO.File]::WriteAllBytes($tmp, [Convert]::FromBase64String(${shellQuote(b64, shell)}))`);
+        lines.push(`#   curl --data-binary "@$tmp" ${shellQuote(u.toString(), shell)}`);
+        lines.push("#   Remove-Item $tmp");
+        // Still emit the (broken) inline form so the command line is non-empty;
+        // the warning above tells the operator to use the temp-file recipe.
+        binaryPipePrefix = `[Convert]::FromBase64String(${shellQuote(b64, shell)}) | `;
+      } else if (shell === "cmd") {
+        // cmd has no trivial inline base64; fall back to a clear marker.
+        lines.push("# WARNING: cmd.exe has no portable inline base64 — write the bytes to a file then pipe with `type file | curl --data-binary @-`");
+        binaryPipePrefix = null;
+      } else {
+        // U12: `echo` adds a trailing newline that flips the body length; use
+        // `printf '%s'` so the base64 input is byte-exact before `base64 -d`.
+        binaryPipePrefix = `printf '%s' ${shellQuote(b64, shell)} | base64 -d | `;
+      }
       parts.push(`--data-binary`, shellQuote(`@-`, shell));
-      parts.push(`# (pipe: ${body.length} bytes of binary data — use file or echo base64)`);
     }
   }
   parts.push(shellQuote(u.toString(), shell));
-  return parts.join(" ");
+  const curlCmd = parts.join(" ");
+  lines.push(binaryPipePrefix ? `${binaryPipePrefix}${curlCmd}` : curlCmd);
+  return lines.join("\n");
 }

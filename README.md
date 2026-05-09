@@ -20,7 +20,7 @@
 
 curl 相当の機能を **undici 直叩き**で提供する。レスポンスボディは content-type に応じて**テキスト decode か base64 encode を自動選択**し、2 MiB で自動 truncate。ヘッダは全て小文字化して返す。
 
-v0.2 では**実用で詰まる所**を埋めた: OAuth2 の主要 3 フロー (client_credentials / refresh / device flow) をトークンキャッシュ付きで、セッションクッキー (tough-cookie) で複数リクエストを跨ぐ状態保持、5xx 指数バックオフリトライ、任意リクエストを cURL コマンド文字列に変換。
+v0.3 では**実用で詰まる所**を埋めた: OAuth2 の主要 3 フロー (client_credentials / refresh / device flow) をトークンキャッシュ付きで、セッションクッキー (tough-cookie) で複数リクエストを跨ぐ状態保持、5xx 指数バックオフリトライ、任意リクエストを cURL コマンド文字列に変換。
 
 ## 特徴
 
@@ -50,11 +50,11 @@ v0.2 では**実用で詰まる所**を埋めた: OAuth2 の主要 3 フロー (
 | `oauth2_client_credentials` | machine-to-machine (M2M) フロー。`basic` / `form` 認証方式対応、scope/audience 付与可、デフォルトで token キャッシュ (`use_cache: false` で無効化) |
 | `oauth2_refresh` | refresh_token フロー |
 | `oauth2_device_start` | デバイス認可フロー開始。`device_code` / `user_code` / `verification_uri` / `interval` を返す |
-| `oauth2_device_poll` | 認可待ちをポーリング (`max_wait_seconds` デフォルト 120、`initial_interval` 秒刻み)。`authorized` / `pending` / `expired` / `denied` |
+| `oauth2_device_poll` | 認可待ちをポーリング (`max_wait_seconds` デフォルト 120、`initial_interval` 秒刻み)。status: `authorized` / `pending` / `expired` / `denied` / `error`。`pending` は isError ではない（同じ device_code で再呼び出し）、`expired` / `denied` / `error` は isError |
 | `oauth2_list_tokens` | キャッシュ済みトークンの一覧（expires_in_s 付き） |
 | `oauth2_clear_cache` | トークンキャッシュ全消去 |
 
-トークンは `(token_url, client_id, scope)` でキャッシュ、有効期限の 30 秒前まで再利用。取得した `access_token` を次のリクエストで `bearer: ...` に渡せば認証済みリクエストが打てる。
+トークンは `(flow, token_url, client_id, secret_fingerprint, scope, audience)` でキャッシュ、有効期限の 30 秒前まで再利用。取得した `access_token` を次のリクエストで `bearer: ...` に渡せば認証済みリクエストが打てる。
 
 ### リトライ
 
@@ -71,17 +71,29 @@ cd http-mcp && npm install && npm run build
 
 ### Claude Code に登録
 
+`<install-dir>` を `git clone` した先の絶対パスに置き換える。
+
 ```bash
-claude mcp add http -- node C:/Users/user/Desktop/http-mcp/dist/index.js
+# POSIX
+claude mcp add http -- node <install-dir>/dist/index.js
+# Windows (PowerShell / cmd)
+claude mcp add http -- node C:\path\to\http-mcp\dist\index.js
 ```
 
 ### 環境変数
 
 | 変数 | デフォルト | 用途 |
 |---|---|---|
-| `HTTP_TIMEOUT` | `30000` | 単一リクエストのタイムアウト (ms) |
+| `HTTP_TIMEOUT` | `30000` | **per-hop** タイムアウト (ms)。各 redirect hop ごとに独立して適用される。**total wall-clock budget = `HTTP_TIMEOUT` × (`max_redirects` + 1)** なので、 redirect 上限を上げると全体のタイムアウトも比例して伸びる |
 | `HTTP_MAX_BODY` | `2097152` | レスポンスボディの最大バイト数 (デフォルト 2 MiB) |
-| `HTTP_USER_AGENT` | `http-mcp/0.1` | 既定の User-Agent |
+| `HTTP_USER_AGENT` | `http-mcp/<package version>` | 既定の User-Agent (package.json の version を反映) |
+| `HTTP_ALLOW_PRIVATE` | (未設定) | `1` で SSRF ガード無効化（loopback / 10/8 / 172.16/12 / 192.168/16 / 169.254/16 / IPv6 ULA / `localhost` / `*.internal` 等を許可） |
+| `HTTP_ALLOW_INSECURE_TLS` | (未設定) | `1` で `reject_unauthorized: false` を尊重。未設定の場合は警告して TLS 検証を強制 |
+| `HTTP_ALLOW_INSECURE_OAUTH` | (未設定) | `1` で OAuth2 token_url / device_authorization_url の `http://` 接続を許可（デフォルトは HTTPS のみ。クライアントシークレット流出を防ぐためテスト用途以外では未設定推奨） |
+| `HTTP_DOWNLOAD_ROOT` | (未設定) | `download` の出力先許可ディレクトリ。**未設定だと `download` は失敗**。`output_path` はこの配下のみ許可、UNC パス (`\\?\`, `\\server\`) は拒否 |
+| `HTTP_DOWNLOAD_MAX` | `1073741824` | `download` の最大バイト数 (デフォルト 1 GiB) — 通常レスポンスの `HTTP_MAX_BODY` とは別 |
+| `HTTP_SESSION_TTL` | `3600000` | セッションの idle TTL (ms)。これを過ぎたセッションは自動 evict |
+| `HTTP_SESSION_MAX` | `256` | 同時に保持できるセッション数の上限 |
 
 ### 呼び出し例
 
@@ -149,12 +161,17 @@ Cookie jar を使った複数リクエストの状態保持:
  "json": {"name": "hello"}}
 ```
 
-バイナリダウンロード:
+バイナリダウンロード（要 `HTTP_DOWNLOAD_ROOT`、`output_path` はその配下に限る、UNC 不可）:
 
+```bash
+# 例: HTTP_DOWNLOAD_ROOT=C:/tmp  をセットしてから
+```
 ```json
 {"action": "download", "url": "https://example.com/asset.zip",
  "output_path": "C:/tmp/asset.zip"}
 ```
+
+レスポンスはストリーミングでディスクに直書きされる (通常レスポンスの 2 MiB 上限と分離、デフォルト `HTTP_DOWNLOAD_MAX=1 GiB`)。
 
 ## レスポンス形式
 
