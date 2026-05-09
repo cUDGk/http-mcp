@@ -177,7 +177,31 @@ Cookie jar を使った複数リクエストの状態保持:
 
 ## セキュリティ注意
 
-`reject_unauthorized: false` は**自己署名証明書を無条件で受け入れる**。MITM リスクがあるので本番 API には使わない。`basic_auth` / `bearer` は**ログには残らない**が、MCP の上位ログに残る可能性はあるので、本物の認証情報を安易に LLM プロンプトに載せない。
+- **SSRF ガード**: `localhost` / `127.0.0.0/8` / `10.0.0.0/8` / `172.16.0.0/12` / `192.168.0.0/16` / `169.254.0.0/16` / IPv6 ULA・link-local・loopback / `*.internal` への接続をデフォルトで拒否。DNS 解決後の IP も再検証。社内ネットワーク向けには `HTTP_ALLOW_PRIVATE=1` を明示的に設定。
+- **リダイレクト再検証**: 各 3xx hop ごとに SSRF ガードを再評価。クロスオリジン redirect では `Authorization` / `Cookie` / `Proxy-Authorization` を破棄。
+- **ヘッダーインジェクション**: ヘッダー名・値を RFC 7230 でバリデート。`bearer` は printable ASCII のみ。
+- **TLS**: `reject_unauthorized: false` は `HTTP_ALLOW_INSECURE_TLS=1` がない限り無視 (警告ログ出力)。
+- **セッション**: caller が指定した `session_id` は SHA-256 でハッシュ化された値を内部で使用 (cross-leak 防止)。idle TTL `HTTP_SESSION_TTL` ms (デフォルト 1 時間) で自動 evict。
+- **OAuth トークンキャッシュ**: cache key に `client_secret` の sha256 fingerprint を含めるため、同じ `client_id` でも secret が違えばキャッシュ衝突しない。
+- **`as_curl` 出力**: `Authorization` / `Cookie` を含むコマンドは平文で出力される。LLM 経由で他者に共有する場合は要注意 (出力に `# WARNING: ...` を自動で前置)。
+- **download**: `HTTP_DOWNLOAD_ROOT` を設定しないと使えない。`output_path` はそれ配下に限定、UNC パスは拒否。
+- 上記に加え、`basic_auth` / `bearer` は**サーバ自身のログには残らない**が、MCP の上位ログに残る可能性はあるので、本物の認証情報を安易に LLM プロンプトに載せない。
+
+## v0.3.1 修正
+
+R4 final-pass: edge-case fixes on top of v0.3.0.
+
+- **セキュリティ**: SSRF guard を `::ffff:127.0.0.1` 等の IPv4-mapped IPv6（dotted / hex 両形式）と `::` (unspecified) にも拡張 (S1 / S2)、OAuth2 全フローで token_url / device_authorization_url の HTTPS を必須化 — `HTTP_ALLOW_INSECURE_OAUTH=1` で明示的に opt-out 可 (S3)、クロスオリジン redirect で caller 由来の `Cookie` ヘッダも破棄するよう拡張 (S4)、`basic_auth.user` に `:` を含む値を拒否 (S5)、`download` の `output_path` で UNC に加え Windows device-namespace path (`\\.\`) も拒否 (S6)、OAuth トークンキャッシュに 512 entry 上限と expired-first eviction を追加 (S7)
+- **バグ**: redirect の body drain で `destroy` が無いストリームを iterate-to-completion でフォールバック (B1)、`hop === maxRedirects` 時に redirect レスポンスを最終応答として返してしまう問題を修正（drain して exceeded-max-redirects を throw）(B2)、`max_body` 到達時の abort と timeout abort を別フラグで track して `aborted_reason` を正しくラベリング (B3)、`oauth2_refresh` のキャッシュキーに `scope` と refresh_token fingerprint を追加（rotation 後に古い token を返す問題を修正）(B4)、`oauth2_device_poll` で 200 + access_token 無 + error 無の応答を `unexpected_200` として明示終了（無限ソフトループ防止）(B5)、`Content-Type: ...; charset=utf-8` 明示時にも UTF-8 BOM を strip (B6)、file sink で `received = cap` を await 完了前に立てていたのを修正 (B7)
+- **UX/Schema/Docs**: `timeout` / `max_body_bytes` / `retry` / `initial_interval` / `session_id` / `extra_params` の describe を整備 (U1-U6)、README env-var table に `HTTP_USER_AGENT` / `HTTP_ALLOW_INSECURE_OAUTH` を追加 (U7)、v0.3.1 changelog 追加 + version 同期 (U8)、stale な `v0.2 では` 文言を v0.3 に更新 (U9)、`HTTP_TIMEOUT` を per-hop と明記し total wall-clock = `timeout × (max_redirects + 1)` を README にも反映 (U10)、`oauth2.ts` の `makeError` 内 catch swallow に理由コメントを追加 (U11)、curl bash の binary body を `echo` から `printf '%s'` へ（trailing newline 防止）(U12)、PowerShell binary の `[Convert]::FromBase64String(...) | curl` がバイト忠実でない警告と temp-file 代替を出力に追加 (U13)
+
+## v0.3.0 修正
+
+セキュリティ・バグ・UX 全方位アップデート。サーバ名を `http-mcp` に統一。
+
+- **セキュリティ**: SSRF ガード (S1)、redirect 毎の再検証 + クロスオリジン認証ヘッダ破棄 (S2)、ヘッダーインジェクション防御 (S3)、TLS 検証バイパスの env ゲート化 (S4)、`download` の path allowlist (S5)、session id ハッシュ + idle TTL evict (S6)、OAuth キャッシュキーに secret fingerprint (S7)、`as_curl` 認証情報警告 (S8)
+- **バグ**: グローバル `Agent` の再利用 (B1)、独自 redirect → `redirects[]` を実値で出力 (B3)、timeout 時に `aborted_reason: "timeout"` を返す (B4)、上限到達時に socket クリーンアップ (B5)、charset / BOM 対応の本文デコード (B6)、`TEXTUAL` regex の修正 (B7)、`Buffer.from` の死コード除去 (B8)、Set-Cookie を redirect 後の最終 URL で保存 (B9)、リトライ末尾の sleep 削除 (B10)、`coerceObject` JSON エラー伝播 (B11)、OAuth `body_encoding=base64` 対応 (B12)、`expires_in - 30` 負値ガード (B13)、device poll の HTTP ステータス分離 (B14)、token レスポンス zod バリデーション (B15)、`body_base64` の Content-Type デフォルト (B16)、`noUncheckedIndexedAccess` 有効化 (B17)、env 数値バリデーション (B18)、SIGTERM/SIGINT 経由のグレースフル shutdown (B19)
+- **UX**: 全プロパティに describe (U1)、`download` ストリーミング書き出し (U2/U3)、README の path / env / 警告整備 (U4)、`as McpResponse` 型化 (U5)、OAuth 構造化エラー (U6)、binary body の curl 警告整形 (U7)、cmd 引用注意書き (U8)、tough-cookie swallow コメント (U9)、unhandledRejection ロガー (U10)
 
 ## v0.2.1 修正
 
